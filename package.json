@@ -1,0 +1,12 @@
+{
+  "name": "spacex-spread-monitor",
+  "private": true,
+  "scripts": {
+    "cf:dev": "wrangler dev",
+    "cf:deploy": "wrangler deploy",
+    "sync:static": "cp spacex_spread_monitor/static/app.js cloudflare/public/static/app.js && cp spacex_spread_monitor/static/styles.css cloudflare/public/static/styles.css"
+  },
+  "devDependencies": {
+    "wrangler": "^4.45.0"
+  }
+}

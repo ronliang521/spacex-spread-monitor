@@ -1,0 +1,9 @@
+# Cloudflare Workers + static assets (same origin as /api/*).
+# Deploy from repo root: npm install && npx wrangler deploy
+name = "spacex-spread-monitor"
+main = "cloudflare/src/index.ts"
+compatibility_date = "2025-05-12"
+
+[assets]
+directory = "cloudflare/public"
+binding = "ASSETS"
