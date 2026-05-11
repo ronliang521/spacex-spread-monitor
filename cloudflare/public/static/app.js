@@ -502,14 +502,33 @@ async function testBark() {
 }
 
 async function fetchBitgetLastFromBrowser() {
-  const url = "https://api.bitget.com/api/v2/spot/market/tickers?symbol=PRESPAXUSDT";
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`bitget_browser_http_${res.status}`);
-  const payload = await res.json();
-  const row = Array.isArray(payload?.data) ? payload.data[0] : null;
-  const v = Number(row?.lastPr);
-  if (!Number.isFinite(v)) throw new Error("bitget_browser_price_missing");
-  return v;
+  // Prefer official public API host. If one endpoint is rate-limited/blocked, fall back.
+  const urls = [
+    "https://api.bitget.com/api/v2/spot/market/tickers?symbol=PRESPAXUSDT",
+    "https://api.bitget.com/api/v2/spot/market/fills?symbol=PRESPAXUSDT&limit=1",
+  ];
+  let lastErr = null;
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, { cache: "no-store", mode: "cors" });
+      if (!res.ok) throw new Error(`bitget_browser_http_${res.status}`);
+      const payload = await res.json();
+      if (url.includes("/tickers")) {
+        const row = Array.isArray(payload?.data) ? payload.data[0] : null;
+        const v = Number(row?.lastPr);
+        if (!Number.isFinite(v)) throw new Error("bitget_browser_price_missing");
+        return v;
+      } else {
+        const row = Array.isArray(payload?.data) ? payload.data[0] : null;
+        const v = Number(row?.price);
+        if (!Number.isFinite(v)) throw new Error("bitget_browser_fills_price_missing");
+        return v;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("bitget_browser_fetch_failed");
 }
 
 function applyBitgetClientFallback(q) {
@@ -537,6 +556,7 @@ function applyBitgetClientFallback(q) {
         meta: {
           ...(q?.spot?.meta || {}),
           source: "bitget_browser_fallback",
+          error: null,
         },
       },
       spread: {
@@ -565,8 +585,8 @@ async function refresh() {
       try {
         q = await applyBitgetClientFallback(q);
       } catch (fallbackErr) {
-        // Keep original payload if browser fallback also fails.
-        console.warn("bitget browser fallback failed", fallbackErr);
+        // If browser fallback fails too, surface the real reason to user.
+        setError(`Bitget 浏览器直连兜底失败：${String(fallbackErr?.message || fallbackErr)}`);
       }
     }
 
