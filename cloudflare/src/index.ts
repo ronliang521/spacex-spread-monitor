@@ -15,7 +15,8 @@ const OKX_SHARES_OUTSTANDING = 1_000_000_000;
 const GATE_SHARES_OUTSTANDING = 2_375_000_000;
 const BITGET_SHARES_OUTSTANDING = 2_307_692_308;
 
-const UPSTREAM_TIMEOUT_MS = 3000;
+// Bitget 在部分 Cloudflare PoP 上偶发 >3s；放宽超时并对 Bitget 做一次重试提升稳定性。
+const UPSTREAM_TIMEOUT_MS = 6000;
 const QUOTE_CACHE_TTL_MS = 900;
 const HIST_APPEND_MIN_INTERVAL_MS = 1500;
 const HISTORY_MAX_POINTS = 200_000;
@@ -224,11 +225,16 @@ async function fetchGateLast(): Promise<{ last: number | null; meta: Record<stri
 async function fetchBitgetLast(): Promise<{ last: number | null; meta: Record<string, unknown> }> {
   const url = "https://api.bitget.com/api/v2/spot/market/tickers";
   const meta: Record<string, unknown> = { url, status: 0, symbol: BITGET_SYMBOL };
-  try {
+  const doFetch = async (attempt: number) => {
     const r = await fetch(`${url}?${new URLSearchParams({ symbol: BITGET_SYMBOL })}`, {
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      headers: {
+        // Some WAFs behave better with explicit accept.
+        accept: "application/json",
+      },
     });
     meta.status = r.status;
+    meta.attempt = attempt;
     if (!r.ok) {
       meta.error = `http_${r.status}`;
       return { last: null, meta };
@@ -244,10 +250,25 @@ async function fetchBitgetLast(): Promise<{ last: number | null; meta: Record<st
     const row = data[0] as Record<string, unknown>;
     meta.ts = row.ts;
     return { last: asFloat(row.lastPr), meta };
-  } catch (e) {
-    meta.error = e instanceof Error ? e.name : "unknown";
-    meta.detail = String(e);
-    return { last: null, meta };
+  };
+
+  try {
+    const r1 = await doFetch(1);
+    if (r1.last != null) return r1;
+    // Retry once only on network/timeout-like cases.
+    if (typeof meta.error === "string" && meta.error.startsWith("http_")) return r1;
+    return r1;
+  } catch (e1) {
+    meta.error = e1 instanceof Error ? e1.name : "unknown";
+    meta.detail = String(e1);
+    // One retry for transient errors/timeouts.
+    try {
+      return await doFetch(2);
+    } catch (e2) {
+      meta.error2 = e2 instanceof Error ? e2.name : "unknown";
+      meta.detail2 = String(e2);
+      return { last: null, meta };
+    }
   }
 }
 

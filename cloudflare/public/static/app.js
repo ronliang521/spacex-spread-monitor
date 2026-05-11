@@ -507,7 +507,14 @@ async function refresh() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const q = await res.json();
 
-    setError("");
+    // If upstream spot venue fails, surface meta error for debugging.
+    const spotLast = q?.spot?.last;
+    const spotErr = q?.spot?.meta?.error;
+    if ((spotLast == null || Number.isNaN(Number(spotLast))) && spotErr) {
+      setError(`Spot 数据源异常（${String(venue)}）：${String(spotErr)}`);
+    } else {
+      setError("");
+    }
     $("okx-last").textContent = fmtNum(q?.okx?.last, 2);
     $("spot-last").textContent = fmtNum(q?.spot?.last, 2);
     $("spread-abs").textContent = fmtNum(q?.spread?.abs, 2);
