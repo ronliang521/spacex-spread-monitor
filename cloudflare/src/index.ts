@@ -592,6 +592,21 @@ export default {
     if (url.pathname.startsWith("/api/")) {
       return handleApi(request);
     }
-    return env.ASSETS.fetch(request);
+    const assetResp = await env.ASSETS.fetch(request);
+
+    // Force revalidation for HTML/app bundle so hotfixes are visible immediately.
+    if (url.pathname === "/" || url.pathname.endsWith(".html") || url.pathname.endsWith("/static/app.js")) {
+      const headers = new Headers(assetResp.headers);
+      headers.set("cache-control", "no-store, no-cache, must-revalidate, max-age=0");
+      headers.set("pragma", "no-cache");
+      headers.set("expires", "0");
+      return new Response(assetResp.body, {
+        status: assetResp.status,
+        statusText: assetResp.statusText,
+        headers,
+      });
+    }
+
+    return assetResp;
   },
 };
