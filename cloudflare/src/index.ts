@@ -5,6 +5,7 @@
 
 export interface Env {
   ASSETS: Fetcher;
+  BROWSER: unknown;
 }
 
 const OKX_INST_ID = "SPACEX-USDT-SWAP";
@@ -321,6 +322,72 @@ async function fetchBitgetLast(): Promise<{ last: number | null; meta: Record<st
   }
 }
 
+async function fetchBitgetLastViaBrowser(env: Env): Promise<{ last: number | null; meta: Record<string, unknown> }> {
+  const meta: Record<string, unknown> = {
+    url: "https://www.bitget.com/zh-CN/spot/PRESPAXUSDT",
+    status: 0,
+    symbol: BITGET_SYMBOL,
+    source: "browser_rendering",
+  };
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const puppeteer = require("@cloudflare/puppeteer");
+    // @ts-ignore - env.BROWSER type is provided by Cloudflare runtime
+    const browser = await puppeteer.launch(env.BROWSER);
+    const page = await browser.newPage();
+    await page.setUserAgent(
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    );
+
+    // Prefer calling the public API inside a browser context (has cookies + JS runtime).
+    const apiUrl = `https://api.bitget.com/api/v2/spot/market/tickers?${new URLSearchParams({ symbol: BITGET_SYMBOL })}`;
+    await page.goto("https://www.bitget.com/zh-CN/spot/PRESPAXUSDT", { waitUntil: "domcontentloaded", timeout: 15_000 });
+
+    const out = await page.evaluate(async (u) => {
+      try {
+        const r = await fetch(u, { cache: "no-store" });
+        const status = r.status;
+        const text = await r.text();
+        return { ok: r.ok, status, text };
+      } catch (e) {
+        return { ok: false, status: 0, text: String(e) };
+      }
+    }, apiUrl);
+
+    meta.browser_fetch_status = out?.status;
+    if (!out?.ok) {
+      meta.error = out?.status ? `http_${out.status}` : "browser_fetch_failed";
+      meta.detail = (out?.text || "").slice(0, 400);
+      await browser.close();
+      return { last: null, meta };
+    }
+
+    let payload: any = null;
+    try {
+      payload = JSON.parse(out.text || "null");
+    } catch {
+      meta.error = "browser_json_parse_failed";
+      meta.detail = String(out?.text || "").slice(0, 400);
+      await browser.close();
+      return { last: null, meta };
+    }
+
+    const row = Array.isArray(payload?.data) ? payload.data[0] : null;
+    const last = asFloat(row?.lastPr);
+    meta.ts = row?.ts;
+    await browser.close();
+    if (last == null) {
+      meta.error = "browser_price_missing";
+      return { last: null, meta };
+    }
+    return { last, meta };
+  } catch (e) {
+    meta.error = e instanceof Error ? e.name : "unknown";
+    meta.detail = String(e);
+    return { last: null, meta };
+  }
+}
+
 async function barkPush(
   baseUrl: string,
   key: string,
@@ -470,6 +537,157 @@ async function handleApiQuote(url: URL): Promise<Response> {
   ]);
 
   const okxLast = okxR.last;
+  let spotLast = spotR.last;
+  const okxMeta = okxR.meta;
+  let spotMeta = spotR.meta;
+
+  // If Bitget is blocked (403) even after endpoint fallback, try Browser Rendering as last resort.
+  if (venueNorm === "bitget" && (spotLast == null) && spotMeta?.error === "http_403") {
+    // Browser Rendering requires binding; if unavailable, skip.
+    // @ts-ignore env is not in this function signature; passed via closure in handler below.
+  }
+
+  let spread: number | null = null;
+  let spreadPct: number | null = null;
+  let mid: number | null = null;
+  if (okxLast != null && spotLast != null) {
+    spread = okxLast - spotLast;
+    mid = (okxLast + spotLast) / 2;
+    if (spotLast !== 0) spreadPct = (spread / spotLast) * 100;
+  }
+
+  const cfg = loadConfig();
+  const okxShares = OKX_SHARES_OUTSTANDING;
+  const spotShares = venueNorm === "bitget" ? BITGET_SHARES_OUTSTANDING : GATE_SHARES_OUTSTANDING;
+  const okxMcap = okxLast != null ? okxLast * okxShares : null;
+  const spotMcap = spotLast != null ? spotLast * spotShares : null;
+  let mcapDiff: number | null = null;
+  let mcapDiffPct: number | null = null;
+  if (okxMcap != null && spotMcap != null) {
+    mcapDiff = okxMcap - spotMcap;
+    if (spotMcap !== 0) mcapDiffPct = (mcapDiff / spotMcap) * 100;
+  }
+
+  maybeAppendHistoryPoint(venueNorm, mcapDiffPct);
+
+  const bark: Record<string, unknown> = {
+    enabled: cfg.bark_enabled,
+    threshold_pct: cfg.bark_threshold_pct,
+    cooldown_seconds: cfg.bark_cooldown_seconds,
+    signal: `mcap_diff_pct_vs_${venueNorm}`,
+    signal_value_pct: mcapDiffPct,
+    sent: false,
+    sent_count: 0,
+    reason: null as string | null,
+  };
+
+  if (cfg.bark_enabled && mcapDiffPct != null) {
+    const hit = Math.abs(Number(mcapDiffPct)) >= Number(cfg.bark_threshold_pct);
+    if (!hit) bark.reason = "no_hit";
+    else {
+      const nowMsVal = nowMs();
+      let sent = 0;
+      for (const key of cfg.bark_keys || []) {
+        const last = lastBarkSentByKeyMs[key];
+        const okToSend = last == null || nowMsVal - last >= cfg.bark_cooldown_seconds * 1000;
+        if (!okToSend) continue;
+        try {
+          const spotSym = venueNorm === "bitget" ? BITGET_SYMBOL : GATE_CURRENCY_PAIR;
+          const body =
+            `OKX(${OKX_INST_ID})=${okxLast}  ${venueNorm.toUpperCase()}(${spotSym})=${spotLast}\n` +
+            `市值差值%（OKX-${venueNorm.toUpperCase()}，相对${venueNorm.toUpperCase()}）=${mcapDiffPct.toFixed(2)}%\n` +
+            `OKX隐含市值=${okxMcap?.toFixed(2)}  ${venueNorm.toUpperCase()}隐含市值=${spotMcap?.toFixed(2)}`;
+          await barkPush(cfg.bark_base_url, key, cfg.bark_title, body, {
+            sound: "alarm",
+            level: "critical",
+            volume: 10,
+            call: 1,
+          });
+          lastBarkSentByKeyMs[key] = nowMsVal;
+          sent += 1;
+        } catch {
+          /* ignore per-key failure */
+        }
+      }
+      bark.sent = sent > 0;
+      bark.sent_count = sent;
+      bark.reason = sent > 0 ? "hit_threshold" : "cooldown";
+    }
+  } else if (cfg.bark_enabled) {
+    bark.reason = "no_signal";
+  }
+
+  const payload = {
+    venue: venueNorm,
+    at_ms: nowMs(),
+    latency_ms: nowMs() - t0,
+    okx: { instId: OKX_INST_ID, last: okxLast, meta: okxMeta },
+    spot: {
+      venue: venueNorm,
+      symbol: venueNorm === "bitget" ? BITGET_SYMBOL : GATE_CURRENCY_PAIR,
+      last: spotLast,
+      meta: spotMeta,
+    },
+    spread: { abs: spread, pct_vs_spot: spreadPct, mid },
+    market_cap: {
+      okx_shares_outstanding: okxShares,
+      spot_shares_outstanding: spotShares,
+      okx_implied_usd: okxMcap,
+      spot_implied_usd: spotMcap,
+      diff_usd: mcapDiff,
+      diff_pct_vs_spot: mcapDiffPct,
+      notes: MCAP_NOTES,
+    },
+    bark,
+  };
+
+  lastQuotePayloadByVenue[venueNorm] = payload as unknown as Record<string, unknown>;
+  lastQuoteAtMsByVenue[venueNorm] = Number(payload.at_ms);
+  return json(payload);
+}
+
+async function handleApi(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const path = (url.pathname || "/").replace(/\/+$/, "") || "/";
+
+  if (path === "/api/config" && request.method === "GET") return handleApiGetConfig();
+  if (path === "/api/config" && request.method === "POST") return handleApiPostConfig(request);
+  if (path === "/api/candles" && request.method === "GET") return handleApiCandles(url);
+  if (path === "/api/quote" && request.method === "GET") return handleApiQuoteWithEnv(url, env);
+  if (path === "/api/bark/test" && request.method === "POST") return handleApiBarkTest(request);
+
+  return json({ error: "not_found", path }, { status: 404 });
+}
+
+async function handleApiQuoteWithEnv(url: URL, env: Env): Promise<Response> {
+  // Reuse the same logic but allow a Browser Rendering last-resort for Bitget.
+  const venueNorm = normalizeVenue(url.searchParams.get("venue"));
+  const now = nowMs();
+
+  const cached = lastQuotePayloadByVenue[venueNorm];
+  const cachedAt = lastQuoteAtMsByVenue[venueNorm];
+  if (cached && cachedAt != null && now - cachedAt <= QUOTE_CACHE_TTL_MS) {
+    const mcap = cached.market_cap as Record<string, unknown> | undefined;
+    const v = asFloat(mcap?.diff_pct_vs_spot);
+    maybeAppendHistoryPoint(venueNorm, v, now);
+    return json(cached);
+  }
+
+  const t0 = now;
+  const [okxR, spotR0] = await Promise.all([
+    fetchOkxLast(),
+    venueNorm === "bitget" ? fetchBitgetLast() : fetchGateLast(),
+  ]);
+
+  let spotR = spotR0;
+  if (venueNorm === "bitget" && spotR.last == null && spotR.meta?.error === "http_403" && env.BROWSER) {
+    const br = await fetchBitgetLastViaBrowser(env);
+    if (br.last != null) spotR = br;
+  }
+
+  // Now proceed using the original quote builder by temporarily injecting the fetched results.
+  // Minimal duplication: rebuild payload here (same as handleApiQuote).
+  const okxLast = okxR.last;
   const spotLast = spotR.last;
   const okxMeta = okxR.meta;
   const spotMeta = spotR.meta;
@@ -573,24 +791,11 @@ async function handleApiQuote(url: URL): Promise<Response> {
   return json(payload);
 }
 
-async function handleApi(request: Request): Promise<Response> {
-  const url = new URL(request.url);
-  const path = (url.pathname || "/").replace(/\/+$/, "") || "/";
-
-  if (path === "/api/config" && request.method === "GET") return handleApiGetConfig();
-  if (path === "/api/config" && request.method === "POST") return handleApiPostConfig(request);
-  if (path === "/api/candles" && request.method === "GET") return handleApiCandles(url);
-  if (path === "/api/quote" && request.method === "GET") return handleApiQuote(url);
-  if (path === "/api/bark/test" && request.method === "POST") return handleApiBarkTest(request);
-
-  return json({ error: "not_found", path }, { status: 404 });
-}
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/api/")) {
-      return handleApi(request);
+      return handleApi(request, env);
     }
     const assetResp = await env.ASSETS.fetch(request);
 

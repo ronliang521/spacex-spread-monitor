@@ -3,7 +3,11 @@
 name = "spacex-spread-monitor"
 main = "cloudflare/src/index.ts"
 compatibility_date = "2025-05-12"
+compatibility_flags = ["nodejs_compat_v2"]
 
 [assets]
 directory = "cloudflare/public"
 binding = "ASSETS"
+
+[browser]
+binding = "BROWSER"
