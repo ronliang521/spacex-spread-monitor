@@ -229,8 +229,15 @@ async function fetchBitgetLast(): Promise<{ last: number | null; meta: Record<st
     const r = await fetch(`${url}?${new URLSearchParams({ symbol: BITGET_SYMBOL })}`, {
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
       headers: {
-        // Some WAFs behave better with explicit accept.
-        accept: "application/json",
+        // Bitget is behind a WAF and sometimes flags serverless fetches.
+        // These headers make the request look like a normal browser XHR.
+        accept: "application/json, text/plain, */*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        // Use a common desktop UA (Workers default UA can be flagged).
+        "user-agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        referer: "https://www.bitget.com/zh-CN/spot/PRESPAXUSDT",
+        origin: "https://www.bitget.com",
       },
     });
     meta.status = r.status;
