@@ -501,11 +501,74 @@ async function testBark() {
   $("bark-last").textContent = lastBarkStatusText;
 }
 
+async function fetchBitgetLastFromBrowser() {
+  const url = "https://api.bitget.com/api/v2/spot/market/tickers?symbol=PRESPAXUSDT";
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`bitget_browser_http_${res.status}`);
+  const payload = await res.json();
+  const row = Array.isArray(payload?.data) ? payload.data[0] : null;
+  const v = Number(row?.lastPr);
+  if (!Number.isFinite(v)) throw new Error("bitget_browser_price_missing");
+  return v;
+}
+
+function applyBitgetClientFallback(q) {
+  const okxLast = Number(q?.okx?.last);
+  if (!Number.isFinite(okxLast)) return q;
+  const spotLast = Number(q?.spot?.last);
+  if (Number.isFinite(spotLast)) return q;
+
+  return fetchBitgetLastFromBrowser().then((browserSpotLast) => {
+    const spread = okxLast - browserSpotLast;
+    const spreadPct = browserSpotLast !== 0 ? (spread / browserSpotLast) * 100 : null;
+    const okxShares = Number(q?.market_cap?.okx_shares_outstanding || 0);
+    const spotShares = Number(q?.market_cap?.spot_shares_outstanding || 0);
+    const okxMcap = okxShares ? okxLast * okxShares : null;
+    const spotMcap = spotShares ? browserSpotLast * spotShares : null;
+    const mcapDiff = okxMcap != null && spotMcap != null ? okxMcap - spotMcap : null;
+    const mcapDiffPct =
+      mcapDiff != null && spotMcap != null && spotMcap !== 0 ? (mcapDiff / spotMcap) * 100 : null;
+
+    return {
+      ...q,
+      spot: {
+        ...(q?.spot || {}),
+        last: browserSpotLast,
+        meta: {
+          ...(q?.spot?.meta || {}),
+          source: "bitget_browser_fallback",
+        },
+      },
+      spread: {
+        ...(q?.spread || {}),
+        abs: spread,
+        pct_vs_spot: spreadPct,
+      },
+      market_cap: {
+        ...(q?.market_cap || {}),
+        okx_implied_usd: okxMcap,
+        spot_implied_usd: spotMcap,
+        diff_usd: mcapDiff,
+        diff_pct_vs_spot: mcapDiffPct,
+      },
+    };
+  });
+}
+
 async function refresh() {
   try {
     const res = await fetch(`/api/quote?venue=${encodeURIComponent(venue)}`, { cache: "no-store" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const q = await res.json();
+    let q = await res.json();
+
+    if (venue === "bitget") {
+      try {
+        q = await applyBitgetClientFallback(q);
+      } catch (fallbackErr) {
+        // Keep original payload if browser fallback also fails.
+        console.warn("bitget browser fallback failed", fallbackErr);
+      }
+    }
 
     setError("");
     $("okx-last").textContent = fmtNum(q?.okx?.last, 2);

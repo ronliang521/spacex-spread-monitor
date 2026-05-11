@@ -223,22 +223,24 @@ async function fetchGateLast(): Promise<{ last: number | null; meta: Record<stri
 }
 
 async function fetchBitgetLast(): Promise<{ last: number | null; meta: Record<string, unknown> }> {
-  const url = "https://api.bitget.com/api/v2/spot/market/tickers";
-  const meta: Record<string, unknown> = { url, status: 0, symbol: BITGET_SYMBOL };
+  const tickerUrl = "https://api.bitget.com/api/v2/spot/market/tickers";
+  const fillsUrl = "https://api.bitget.com/api/v2/spot/market/fills";
+  const meta: Record<string, unknown> = { url: tickerUrl, status: 0, symbol: BITGET_SYMBOL };
+  const requestHeaders = {
+    // Bitget is behind a WAF and sometimes flags serverless fetches.
+    // These headers make the request look like a normal browser XHR.
+    accept: "application/json, text/plain, */*",
+    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+    // Use a common desktop UA (Workers default UA can be flagged).
+    "user-agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    referer: "https://www.bitget.com/zh-CN/spot/PRESPAXUSDT",
+    origin: "https://www.bitget.com",
+  };
   const doFetch = async (attempt: number) => {
-    const r = await fetch(`${url}?${new URLSearchParams({ symbol: BITGET_SYMBOL })}`, {
+    const r = await fetch(`${tickerUrl}?${new URLSearchParams({ symbol: BITGET_SYMBOL })}`, {
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-      headers: {
-        // Bitget is behind a WAF and sometimes flags serverless fetches.
-        // These headers make the request look like a normal browser XHR.
-        accept: "application/json, text/plain, */*",
-        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-        // Use a common desktop UA (Workers default UA can be flagged).
-        "user-agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        referer: "https://www.bitget.com/zh-CN/spot/PRESPAXUSDT",
-        origin: "https://www.bitget.com",
-      },
+      headers: requestHeaders,
     });
     meta.status = r.status;
     meta.attempt = attempt;
@@ -259,21 +261,61 @@ async function fetchBitgetLast(): Promise<{ last: number | null; meta: Record<st
     return { last: asFloat(row.lastPr), meta };
   };
 
+  const fetchFromFills = async () => {
+    meta.fallback = "fills";
+    const r = await fetch(`${fillsUrl}?${new URLSearchParams({ symbol: BITGET_SYMBOL, limit: "1" })}`, {
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      headers: requestHeaders,
+    });
+    meta.fallback_status = r.status;
+    if (!r.ok) {
+      meta.fallback_error = `http_${r.status}`;
+      return { last: null, meta };
+    }
+    const payload = (await r.json()) as Record<string, unknown>;
+    const data = payload.data;
+    if (!Array.isArray(data) || !data.length) {
+      meta.fallback_error = "unexpected_bitget_fills_payload";
+      return { last: null, meta };
+    }
+    const row = data[0] as Record<string, unknown>;
+    const last = asFloat(row.price);
+    meta.fallback_ts = row.ts;
+    if (last == null) {
+      meta.fallback_error = "bitget_fills_price_missing";
+      return { last: null, meta };
+    }
+    return { last, meta };
+  };
+
   try {
     const r1 = await doFetch(1);
     if (r1.last != null) return r1;
-    // Retry once only on network/timeout-like cases.
-    if (typeof meta.error === "string" && meta.error.startsWith("http_")) return r1;
+    // If ticker route is blocked by WAF (403), fallback to latest fills endpoint.
+    if (meta.error === "http_403") {
+      return await fetchFromFills();
+    }
     return r1;
   } catch (e1) {
     meta.error = e1 instanceof Error ? e1.name : "unknown";
     meta.detail = String(e1);
     // One retry for transient errors/timeouts.
     try {
-      return await doFetch(2);
+      const r2 = await doFetch(2);
+      if (r2.last != null) return r2;
+      if (meta.error === "http_403") {
+        return await fetchFromFills();
+      }
+      return r2;
     } catch (e2) {
       meta.error2 = e2 instanceof Error ? e2.name : "unknown";
       meta.detail2 = String(e2);
+      try {
+        return await fetchFromFills();
+      } catch (e3) {
+        meta.error3 = e3 instanceof Error ? e3.name : "unknown";
+        meta.detail3 = String(e3);
+      }
       return { last: null, meta };
     }
   }
