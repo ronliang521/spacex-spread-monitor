@@ -1,0 +1,8 @@
+{
+  "bark_enabled": false,
+  "bark_base_url": "https://api.day.app",
+  "bark_title": "SPACEX/SPCX 价差提醒",
+  "bark_keys": [],
+  "bark_threshold_pct": 1,
+  "bark_cooldown_seconds": 60
+}
