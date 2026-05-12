@@ -3,9 +3,13 @@
  * State (config, history, quote cache, bark cooldown) lives in isolate memory.
  */
 
+import { buildBitgetHistRemotePayload, buildGateHistRemotePayload } from "./remoteCandles";
+
 export interface Env {
   ASSETS: Fetcher;
   BROWSER: unknown;
+  /** 可选：自建 FastAPI 根 URL（无尾斜杠）。设置后 remote K 线可反向代理到宿主（备用）。 */
+  BACKEND_ORIGIN?: string;
 }
 
 const OKX_INST_ID = "SPACEX-USDT-SWAP";
@@ -13,17 +17,32 @@ const GATE_CURRENCY_PAIR = "SPCX_USDT";
 const BITGET_SYMBOL = "PRESPAXUSDT";
 
 const OKX_SHARES_OUTSTANDING = 1_000_000_000;
-const GATE_SHARES_OUTSTANDING = 2_375_000_000;
+const GATE_SHARES_NUMERATOR = 1_400_000_000_000;
+const GATE_SHARES_DENOMINATOR = 590;
+/** Gate：总股本 = 1.4 万亿 / 590（与 FastAPI main.py 一致） */
+const GATE_SHARES_OUTSTANDING = GATE_SHARES_NUMERATOR / GATE_SHARES_DENOMINATOR;
 const BITGET_SHARES_OUTSTANDING = 2_307_692_308;
+
+/** 股本口径变更时递增，用于丢弃 Worker 内旧 quote 缓存（否则会短暂返回旧股数）。 */
+const QUOTE_SHARES_REVISION = 2;
 
 // Bitget 在部分 Cloudflare PoP 上偶发 >3s；放宽超时并对 Bitget 做一次重试提升稳定性。
 const UPSTREAM_TIMEOUT_MS = 6000;
 const QUOTE_CACHE_TTL_MS = 900;
 const HIST_APPEND_MIN_INTERVAL_MS = 1500;
 const HISTORY_MAX_POINTS = 200_000;
+/** 与 FastAPI main.py MAX_HIST_CANDLES_RESPONSE 一致（旧 5000 会裁掉长默认窗左侧） */
+const MAX_HIST_CANDLES_RESPONSE = 100_000;
 
-const MCAP_NOTES =
-  "固定口径：OKX=10亿股；Spot=2.375B 股。OKX Pre-IPO 合约为每股价口径；Spot 用固定股本推导隐含市值。";
+const GATE_SPOT_PAGE_URL = "https://www.gate.com/zh/trade/SPCX_USDT";
+const BITGET_SPOT_PAGE_URL = "https://www.bitget.com/zh-CN/spot/PRESPAXUSDT";
+
+const MCAP_NOTES_GATE =
+  "固定口径：OKX=10亿股；Gate 现货总股本=1.4万亿/590 股。OKX Pre-IPO 合约为每股价口径；Spot 用固定股本推导隐含市值。";
+const MCAP_NOTES_BITGET =
+  "固定口径：OKX=10亿股；Bitget PRESPAX 现货股本见 Worker/BITGET_SHARES_OUTSTANDING（IPO Prime 推导）。现货来自 Bitget 公开 REST，品种与官网 " +
+  BITGET_SPOT_PAGE_URL +
+  " 一致。";
 
 type VenueNorm = "gate" | "bitget";
 
@@ -235,7 +254,7 @@ async function fetchBitgetLast(): Promise<{ last: number | null; meta: Record<st
     // Use a common desktop UA (Workers default UA can be flagged).
     "user-agent":
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    referer: "https://www.bitget.com/zh-CN/spot/PRESPAXUSDT",
+    referer: BITGET_SPOT_PAGE_URL,
     origin: "https://www.bitget.com",
   };
   const doFetch = async (attempt: number) => {
@@ -324,7 +343,7 @@ async function fetchBitgetLast(): Promise<{ last: number | null; meta: Record<st
 
 async function fetchBitgetLastViaBrowser(env: Env): Promise<{ last: number | null; meta: Record<string, unknown> }> {
   const meta: Record<string, unknown> = {
-    url: "https://www.bitget.com/zh-CN/spot/PRESPAXUSDT",
+    url: BITGET_SPOT_PAGE_URL,
     status: 0,
     symbol: BITGET_SYMBOL,
     source: "browser_rendering",
@@ -341,7 +360,7 @@ async function fetchBitgetLastViaBrowser(env: Env): Promise<{ last: number | nul
 
     // Prefer calling the public API inside a browser context (has cookies + JS runtime).
     const apiUrl = `https://api.bitget.com/api/v2/spot/market/tickers?${new URLSearchParams({ symbol: BITGET_SYMBOL })}`;
-    await page.goto("https://www.bitget.com/zh-CN/spot/PRESPAXUSDT", { waitUntil: "domcontentloaded", timeout: 15_000 });
+    await page.goto(BITGET_SPOT_PAGE_URL, { waitUntil: "domcontentloaded", timeout: 15_000 });
 
     const out = await page.evaluate(async (u) => {
       try {
@@ -416,6 +435,7 @@ function json(data: unknown, init?: ResponseInit): Response {
     ...init,
     headers: {
       "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
       ...(init?.headers as Record<string, string>),
     },
   });
@@ -465,11 +485,68 @@ async function handleApiBarkTest(request: Request): Promise<Response> {
   }
 }
 
-function handleApiCandles(url: URL): Response {
+const GATE_HIST_FROM_MS = 1778148000 * 1000; // 北京时间 2026-05-07 18:00（与 Python 默认窗一致）
+
+function normalizeBackendOrigin(env: Env): string | null {
+  const raw = env.BACKEND_ORIGIN;
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const s = raw.trim().replace(/\/+$/, "");
+  return s.startsWith("http") ? s : `https://${s}`;
+}
+
+async function proxyBackendApi(env: Env, pathname: string, url: URL): Promise<Response | null> {
+  const origin = normalizeBackendOrigin(env);
+  if (!origin) return null;
+  try {
+    const target = new URL(pathname, origin.endsWith("/") ? origin : `${origin}/`);
+    url.searchParams.forEach((v, k) => target.searchParams.set(k, v));
+    const r = await fetch(target.toString(), {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(120_000),
+    });
+    const headers = new Headers();
+    const ct = r.headers.get("content-type");
+    if (ct) headers.set("content-type", ct);
+    return new Response(r.body, { status: r.status, headers });
+  } catch {
+    return null;
+  }
+}
+
+async function handleApiCandles(url: URL, env: Env): Promise<Response> {
+  const venue = normalizeVenue(url.searchParams.get("venue"));
+  const source = (url.searchParams.get("source") || "remote").toLowerCase();
+
+  if ((venue === "gate" || venue === "bitget") && source !== "local") {
+    const proxied = await proxyBackendApi(env, "/api/candles", url);
+    if (proxied != null) return proxied;
+    const supportedRemote = new Set([60, 300, 3600, 14_400, 86_400]);
+    let tf = Number(url.searchParams.get("tf") || "60");
+    if (!supportedRemote.has(tf)) tf = 60;
+    try {
+      const payload =
+        venue === "gate" ? await buildGateHistRemotePayload(tf) : await buildBitgetHistRemotePayload(tf);
+      return json(payload);
+    } catch (e) {
+      const ds = venue === "gate" ? "okx_gate_public_rest" : "okx_bitget_public_rest";
+      return json(
+        {
+          tf,
+          venue,
+          candles: [],
+          range: { min: null, max: null },
+          error: String(e),
+          data_source: ds,
+          data_source_detail: `Worker 内联 REST 失败（可配置 wrangler secret BACKEND_ORIGIN 指向 FastAPI）：${String(e)}`,
+        },
+        { status: 502 },
+      );
+    }
+  }
+
   const supported = new Set([60, 120, 180, 300, 900, 1800, 3600, 10800, 21600, 86400]);
   let tf = Number(url.searchParams.get("tf") || "60");
   if (!supported.has(tf)) tf = 60;
-  const venue = normalizeVenue(url.searchParams.get("venue"));
   const pts = [...histPointsByVenue[venue]];
 
   type Candle = { t: number; o: number; h: number; l: number; c: number };
@@ -479,11 +556,14 @@ function handleApiCandles(url: URL): Response {
   let h: number | null = null;
   let l: number | null = null;
   let c: number | null = null;
+  let usedPts = 0;
 
   for (const p of pts) {
     const tMs = Math.floor(p.t || 0);
+    if ((venue === "gate" || venue === "bitget") && tMs < GATE_HIST_FROM_MS) continue;
     const v = p.v;
     if (v == null || Number.isNaN(v)) continue;
+    usedPts += 1;
     const b = bucketStartMs(tMs, tf);
     if (curBucket == null || b !== curBucket) {
       if (curBucket != null && o != null && h != null && l != null && c != null) {
@@ -501,19 +581,40 @@ function handleApiCandles(url: URL): Response {
     candles.push({ t: Math.floor(curBucket / 1000), o, h, l, c });
   }
 
-  const lows = candles.map((x) => x.l);
-  const highs = candles.map((x) => x.h);
+  const nBuilt = candles.length;
+  const candlesOut =
+    nBuilt > MAX_HIST_CANDLES_RESPONSE ? candles.slice(-MAX_HIST_CANDLES_RESPONSE) : candles;
+  const lows = candlesOut.map((x) => x.l);
+  const highs = candlesOut.map((x) => x.h);
   const rng = {
     min: lows.length ? Math.min(...lows) : null,
     max: highs.length ? Math.max(...highs) : null,
   };
-  return json({
+  const payload: Record<string, unknown> = {
     tf,
     venue,
-    candles: candles.slice(-5000),
+    candles: candlesOut,
+    candles_built: nBuilt,
+    candles_truncated: nBuilt > MAX_HIST_CANDLES_RESPONSE,
+    candles_max_return: MAX_HIST_CANDLES_RESPONSE,
     range: rng,
-    points: pts.length,
-  });
+    points: usedPts,
+    points_raw: pts.length,
+    hist_from_ms: venue === "gate" || venue === "bitget" ? GATE_HIST_FROM_MS : null,
+    data_source: "worker_memory_quote_samples",
+    aggregation: "worker_memory_quote_samples",
+    candles_first_ts: candlesOut.length ? candlesOut[0].t : null,
+    candles_last_ts: candlesOut.length ? candlesOut[candlesOut.length - 1].t : null,
+  };
+  if (venue === "gate" && source === "local") {
+    payload.data_source_detail =
+      "Worker 内存报价点聚合（source=local）；默认 remote 已改为 OKX+Gate 公开 REST 全量对齐。";
+  }
+  if (venue === "bitget" && source === "local") {
+    payload.data_source_detail =
+      "Worker 内存报价点聚合（source=local）；默认 remote 已改为 OKX+Bitget 公开 REST 全量对齐。";
+  }
+  return json(payload);
 }
 
 async function handleApiQuote(url: URL): Promise<Response> {
@@ -522,7 +623,13 @@ async function handleApiQuote(url: URL): Promise<Response> {
 
   const cached = lastQuotePayloadByVenue[venueNorm];
   const cachedAt = lastQuoteAtMsByVenue[venueNorm];
-  if (cached && cachedAt != null && now - cachedAt <= QUOTE_CACHE_TTL_MS) {
+  const revQ = Number((cached as Record<string, unknown> | undefined)?.shares_revision) || 0;
+  if (
+    cached &&
+    cachedAt != null &&
+    now - cachedAt <= QUOTE_CACHE_TTL_MS &&
+    revQ === QUOTE_SHARES_REVISION
+  ) {
     const mcap = cached.market_cap as Record<string, unknown> | undefined;
     const v = asFloat(mcap?.diff_pct_vs_spot);
     maybeAppendHistoryPoint(venueNorm, v, now);
@@ -617,8 +724,24 @@ async function handleApiQuote(url: URL): Promise<Response> {
     bark.reason = "no_signal";
   }
 
+  const mcapQ: Record<string, unknown> = {
+    okx_shares_outstanding: okxShares,
+    spot_shares_outstanding: spotShares,
+    okx_implied_usd: okxMcap,
+    spot_implied_usd: spotMcap,
+    diff_usd: mcapDiff,
+    diff_pct_vs_spot: mcapDiffPct,
+    notes: venueNorm === "gate" ? MCAP_NOTES_GATE : MCAP_NOTES_BITGET,
+    spot_shares_formula: null as string | null,
+  };
+  if (venueNorm === "gate") {
+    mcapQ.spot_shares_formula = `${GATE_SHARES_NUMERATOR}/${GATE_SHARES_DENOMINATOR}`;
+    mcapQ.spot_shares_outstanding_exact = GATE_SHARES_OUTSTANDING;
+  }
+
   const payload = {
     venue: venueNorm,
+    shares_revision: QUOTE_SHARES_REVISION,
     at_ms: nowMs(),
     latency_ms: nowMs() - t0,
     okx: { instId: OKX_INST_ID, last: okxLast, meta: okxMeta },
@@ -627,17 +750,10 @@ async function handleApiQuote(url: URL): Promise<Response> {
       symbol: venueNorm === "bitget" ? BITGET_SYMBOL : GATE_CURRENCY_PAIR,
       last: spotLast,
       meta: spotMeta,
+      spot_page: venueNorm === "bitget" ? BITGET_SPOT_PAGE_URL : GATE_SPOT_PAGE_URL,
     },
     spread: { abs: spread, pct_vs_spot: spreadPct, mid },
-    market_cap: {
-      okx_shares_outstanding: okxShares,
-      spot_shares_outstanding: spotShares,
-      okx_implied_usd: okxMcap,
-      spot_implied_usd: spotMcap,
-      diff_usd: mcapDiff,
-      diff_pct_vs_spot: mcapDiffPct,
-      notes: MCAP_NOTES,
-    },
+    market_cap: mcapQ,
     bark,
   };
 
@@ -652,7 +768,20 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
   if (path === "/api/config" && request.method === "GET") return handleApiGetConfig();
   if (path === "/api/config" && request.method === "POST") return handleApiPostConfig(request);
-  if (path === "/api/candles" && request.method === "GET") return handleApiCandles(url);
+  if (path === "/api/candles" && request.method === "GET") return await handleApiCandles(url, env);
+  if (path === "/api/price-spread-candles" && request.method === "GET") {
+    const proxied = await proxyBackendApi(env, "/api/price-spread-candles", url);
+    if (proxied != null) return proxied;
+    return json(
+      {
+        ok: false,
+        error: "cloudflare_worker_stub",
+        hint:
+          "价差 USDT K 线需在 FastAPI 运行 /api/price-spread-candles，或在 Worker 环境变量中设置 BACKEND_ORIGIN 指向该后端以反向代理。历史差值% K 线（Gate / Bitget）已由 Worker 内联 OKX+对应现货 REST 支持（与 FastAPI 同源算法）。",
+      },
+      { status: 501 },
+    );
+  }
   if (path === "/api/quote" && request.method === "GET") return handleApiQuoteWithEnv(url, env);
   if (path === "/api/bark/test" && request.method === "POST") return handleApiBarkTest(request);
 
@@ -666,7 +795,13 @@ async function handleApiQuoteWithEnv(url: URL, env: Env): Promise<Response> {
 
   const cached = lastQuotePayloadByVenue[venueNorm];
   const cachedAt = lastQuoteAtMsByVenue[venueNorm];
-  if (cached && cachedAt != null && now - cachedAt <= QUOTE_CACHE_TTL_MS) {
+  const rev0 = Number((cached as Record<string, unknown> | undefined)?.shares_revision) || 0;
+  if (
+    cached &&
+    cachedAt != null &&
+    now - cachedAt <= QUOTE_CACHE_TTL_MS &&
+    rev0 === QUOTE_SHARES_REVISION
+  ) {
     const mcap = cached.market_cap as Record<string, unknown> | undefined;
     const v = asFloat(mcap?.diff_pct_vs_spot);
     maybeAppendHistoryPoint(venueNorm, v, now);
@@ -762,8 +897,24 @@ async function handleApiQuoteWithEnv(url: URL, env: Env): Promise<Response> {
     bark.reason = "no_signal";
   }
 
+  const mcapW: Record<string, unknown> = {
+    okx_shares_outstanding: okxShares,
+    spot_shares_outstanding: spotShares,
+    okx_implied_usd: okxMcap,
+    spot_implied_usd: spotMcap,
+    diff_usd: mcapDiff,
+    diff_pct_vs_spot: mcapDiffPct,
+    notes: venueNorm === "gate" ? MCAP_NOTES_GATE : MCAP_NOTES_BITGET,
+    spot_shares_formula: null as string | null,
+  };
+  if (venueNorm === "gate") {
+    mcapW.spot_shares_formula = `${GATE_SHARES_NUMERATOR}/${GATE_SHARES_DENOMINATOR}`;
+    mcapW.spot_shares_outstanding_exact = GATE_SHARES_OUTSTANDING;
+  }
+
   const payload = {
     venue: venueNorm,
+    shares_revision: QUOTE_SHARES_REVISION,
     at_ms: nowMs(),
     latency_ms: nowMs() - t0,
     okx: { instId: OKX_INST_ID, last: okxLast, meta: okxMeta },
@@ -772,17 +923,10 @@ async function handleApiQuoteWithEnv(url: URL, env: Env): Promise<Response> {
       symbol: venueNorm === "bitget" ? BITGET_SYMBOL : GATE_CURRENCY_PAIR,
       last: spotLast,
       meta: spotMeta,
+      spot_page: venueNorm === "bitget" ? BITGET_SPOT_PAGE_URL : GATE_SPOT_PAGE_URL,
     },
     spread: { abs: spread, pct_vs_spot: spreadPct, mid },
-    market_cap: {
-      okx_shares_outstanding: okxShares,
-      spot_shares_outstanding: spotShares,
-      okx_implied_usd: okxMcap,
-      spot_implied_usd: spotMcap,
-      diff_usd: mcapDiff,
-      diff_pct_vs_spot: mcapDiffPct,
-      notes: MCAP_NOTES,
-    },
+    market_cap: mcapW,
     bark,
   };
 

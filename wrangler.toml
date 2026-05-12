@@ -11,3 +11,7 @@ binding = "ASSETS"
 
 [browser]
 binding = "BROWSER"
+
+# 可选：Cloudflare Worker 将 /api/candles（Gate+remote）反向代理到自建 FastAPI（失败时回退 Worker 内联 REST）。
+# wrangler secret put BACKEND_ORIGIN
+# 例：https://your-tunnel.example.com

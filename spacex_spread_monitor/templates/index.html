@@ -3,6 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- 可选：Cloudflare 页面仍走旧 Worker 时，填 FastAPI 根 URL（无尾斜杠），或用控制台 localStorage.setItem("SPACEX_MONITOR_API_BASE","https://…") -->
+    <meta name="spacex-monitor-api-base" content="" />
     <title>SPACEX/SPCX · 价差监控</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -64,6 +66,38 @@
         </div>
       </section>
 
+      <section class="table-card" aria-labelledby="spread-k-title" style="margin-bottom: 1rem">
+        <h2 id="spread-k-title">OKX×Gate 价格价差 K 线（USDT）</h2>
+        <p id="spread-hint" class="hint" style="margin: 0.35rem 1rem 0.75rem">
+          口径：<strong>OKX 永续 − Gate 现货</strong>（<code>{{ okx_inst_id }}</code> vs <code>{{ gate_pair }}</code>）。数据来自两家公开 REST
+          K 线并按同一时间桶对齐。<strong>默认时间窗</strong>：<strong>北京时间 2026-05-07 18:00</strong> 起至当前（与 UTC
+          2026-05-07 10:00 对齐）；可切换到「从 OKX 日 K 可溯起点」。<strong>1D</strong> 为
+          <strong>UTC 自然日</strong>：由对齐后的 1h 价差聚合；日 K 横轴按 UTC 日期标注。
+        </p>
+        <div class="controls" style="margin: 0.5rem 1rem 0.75rem">
+          <div class="segmented" role="group" aria-label="价差时间窗">
+            <button type="button" id="btn-spread-win-default" class="active">5/7 18:00 北京起</button>
+            <button type="button" id="btn-spread-win-listing">OKX 可溯起点</button>
+          </div>
+        </div>
+        <div class="controls" style="margin: 0.5rem 1rem 1rem">
+          <div class="segmented" role="group" aria-label="价差K线周期">
+            <button type="button" data-spread-tf="1m" class="active">1m</button>
+            <button type="button" data-spread-tf="5m">5m</button>
+            <button type="button" data-spread-tf="1h">1h</button>
+            <button type="button" data-spread-tf="4h">4h</button>
+            <button type="button" data-spread-tf="1d">1D（24h）</button>
+          </div>
+          <div class="actions">
+            <button type="button" class="btn btn-ghost" id="btn-spread-refresh">刷新</button>
+          </div>
+        </div>
+        <div style="padding: 0 1rem 1rem">
+          <div id="spread-range" class="mono" style="color: var(--muted); font-size: 0.85rem; margin-bottom: 0.5rem">—</div>
+          <div id="spread-chart" style="height: 360px"></div>
+        </div>
+      </section>
+
       <section class="table-card" aria-labelledby="mcap-title" style="margin-bottom: 1rem">
         <h2 id="mcap-title">隐含股票市值对比（USD）</h2>
         <div class="table-scroll">
@@ -75,7 +109,10 @@
               </tr>
               <tr>
                 <td><span id="spot-shares-label">Gate</span> 总股数（固定）</td>
-                <td id="spot-shares-out" class="mono">—</td>
+                <td>
+                  <span id="spot-shares-out" class="mono">—</span>
+                  <div id="spot-shares-formula" class="mono" style="font-size: 0.82rem; color: var(--muted); margin-top: 0.2rem"></div>
+                </td>
               </tr>
               <tr>
                 <td>OKX 隐含市值</td>
@@ -182,18 +219,24 @@
 
       <section class="table-card" aria-labelledby="hist-title" style="margin-top: 1rem">
         <h2 id="hist-title">历史价差 K 线（差值% 相对 <span id="hist-spot-label">Gate</span>）</h2>
+        <p id="hist-hint" class="hint" style="margin: 0.35rem 1rem 0.75rem">
+          纵轴为<strong>隐含市值差值%</strong>（相对 Gate），股数与后端 <code>main.py</code> 常量一致：<strong>OKX</strong>
+          <code>10 亿股</code> × 永续价（REST <code>SPACEX-USDT-SWAP</code>）、<strong>Gate</strong>
+          <code>1.4 万亿÷590</code> 股 × 现货价（REST <code>SPCX_USDT</code>）。公式：
+          <strong>[(OKX总股数×OKX合约价) − (Gate总股数×Gate现货价)] ÷ (Gate总股数×Gate现货价) × 100%</strong>。
+          行情为 OKX/Gate <strong>公开 REST</strong>（与
+          <a href="https://www.okx.com/zh-hans/trade-swap/spacex-usdt-swap" target="_blank" rel="noopener">OKX 永续页</a>、
+          <a href="https://www.gate.com/zh/trade/SPCX_USDT" target="_blank" rel="noopener">Gate 现货页</a>
+          同源标的），1m 对齐后聚合成所选周期；<strong>默认窗</strong>北京时间 <strong>2026-05-07 18:00</strong> 起；下方 K 线轴/十字线为 <strong>北京时间</strong>。
+          <code>?source=local</code> 仅用本地 NDJSON。<strong>上方 USDT 价差 K</strong>随 Tab 切换为 OKX×Gate 或 OKX×Bitget，与下方市值差%同源 1m 对齐。后台采样写盘供 Bark/离线。
+        </p>
         <div class="controls" style="margin: 0.5rem 1rem 1rem">
           <div class="segmented" role="group" aria-label="K线周期">
             <button type="button" data-tf="60" class="active">1m</button>
-            <button type="button" data-tf="120">2m</button>
-            <button type="button" data-tf="180">3m</button>
             <button type="button" data-tf="300">5m</button>
-            <button type="button" data-tf="900">15m</button>
-            <button type="button" data-tf="1800">30m</button>
             <button type="button" data-tf="3600">1h</button>
-            <button type="button" data-tf="10800">3h</button>
-            <button type="button" data-tf="21600">6h</button>
-            <button type="button" data-tf="86400">24h</button>
+            <button type="button" data-tf="14400">4h</button>
+            <button type="button" data-tf="86400">1D（UTC）</button>
           </div>
           <div class="actions">
             <button type="button" class="btn btn-ghost" id="btn-hist-refresh">刷新</button>
