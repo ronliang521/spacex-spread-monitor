@@ -18,6 +18,27 @@ import {
 
 export const SPREAD_DEFAULT_FROM_TS_SEC = 1778148000; // 北京时间 2026-05-07 18:00（与 Python _SPREAD_DEFAULT_FROM_TS_SEC 一致）
 
+/** `Math.min(...arr)` 在 arr 很大时会超过引擎参数上限（Worker 内抛错→502）；用循环聚合 */
+function minFinite(nums: number[]): number | null {
+  if (!nums.length) return null;
+  let m = nums[0];
+  for (let i = 1; i < nums.length; i++) {
+    const x = nums[i];
+    if (x < m) m = x;
+  }
+  return m;
+}
+
+function maxFinite(nums: number[]): number | null {
+  if (!nums.length) return null;
+  let m = nums[0];
+  for (let i = 1; i < nums.length; i++) {
+    const x = nums[i];
+    if (x > m) m = x;
+  }
+  return m;
+}
+
 /** 与 main.py `_aligned_rest_fetch_start_sec` 同源：OKX 日 K discovery 偏晚时仍以默认窗为 REST 拉取起点下限 */
 function alignedRestFetchStartSec(discoverSec: number): number {
   return Math.min(Math.floor(discoverSec), SPREAD_DEFAULT_FROM_TS_SEC);
@@ -168,7 +189,7 @@ async function okxFetchCandlesMap(bar: string, startSec: number, endSec: number)
   }
 
   let afterMs =
-    out.size > 0 ? Math.min(...Array.from(out.keys())) * 1000 : Math.floor(endSec) * 1000;
+    out.size > 0 ? minFinite(Array.from(out.keys()))! * 1000 : Math.floor(endSec) * 1000;
   const urlHist = "https://www.okx.com/api/v5/market/history-candles";
   for (let iter = 0; iter < 3000; iter++) {
     const p = new URLSearchParams({
@@ -599,8 +620,8 @@ export async function buildPriceSpreadCandlesPayload(url: URL): Promise<Record<s
   const lows = candlesOut.map((x) => x.l);
   const highs = candlesOut.map((x) => x.h);
   const rng = {
-    min: lows.length ? Math.min(...lows) : null,
-    max: highs.length ? Math.max(...highs) : null,
+    min: minFinite(lows),
+    max: maxFinite(highs),
   };
 
   const effCn = new Intl.DateTimeFormat("zh-CN", {
@@ -721,8 +742,8 @@ export async function buildGateHistRemotePayload(tfSecIn: number): Promise<Recor
   const lows = candlesOut.map((x) => x.l);
   const highs = candlesOut.map((x) => x.h);
   const rng = {
-    min: lows.length ? Math.min(...lows) : null,
-    max: highs.length ? Math.max(...highs) : null,
+    min: minFinite(lows),
+    max: maxFinite(highs),
   };
 
   const windowFromBeijing = new Intl.DateTimeFormat("zh-CN", {
@@ -836,8 +857,8 @@ export async function buildBitgetHistRemotePayload(tfSecIn: number): Promise<Rec
   const lows = candlesOut.map((x) => x.l);
   const highs = candlesOut.map((x) => x.h);
   const rng = {
-    min: lows.length ? Math.min(...lows) : null,
-    max: highs.length ? Math.max(...highs) : null,
+    min: minFinite(lows),
+    max: maxFinite(highs),
   };
 
   const windowFromBeijing = new Intl.DateTimeFormat("zh-CN", {

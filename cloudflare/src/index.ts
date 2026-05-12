@@ -523,7 +523,14 @@ async function handleApiCandles(url: URL, env: Env): Promise<Response> {
 
   if ((venue === "gate" || venue === "bitget") && source !== "local") {
     const proxied = await proxyBackendApi(env, "/api/candles", url);
-    if (proxied != null) return proxied;
+    if (proxied != null) {
+      if (proxied.ok) return proxied;
+      try {
+        await proxied.body?.cancel?.();
+      } catch {
+        /* ignore */
+      }
+    }
     const supportedRemote = new Set([60, 300, 3600, 14_400, 86_400]);
     let tf = Number(url.searchParams.get("tf") || "60");
     if (!supportedRemote.has(tf)) tf = 60;
@@ -775,7 +782,14 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (path === "/api/candles" && request.method === "GET") return await handleApiCandles(url, env);
   if (path === "/api/price-spread-candles" && request.method === "GET") {
     const proxied = await proxyBackendApi(env, "/api/price-spread-candles", url);
-    if (proxied != null) return proxied;
+    if (proxied != null) {
+      if (proxied.ok) return proxied;
+      try {
+        await proxied.body?.cancel?.();
+      } catch {
+        /* ignore */
+      }
+    }
     try {
       const payload = await buildPriceSpreadCandlesPayload(url);
       return json(payload);
