@@ -307,6 +307,71 @@ async function bitgetFetchCandlesMap(startSec: number, endSec: number): Promise<
   return out;
 }
 
+/** OKX 永续 close − 现货 close（USDT），与 main.py `_spread_ohlc` 一致 */
+type Tuple4 = [number, number, number, number];
+
+function spreadOhlc(okx: Tuple4, spot: Tuple4): Tuple4 {
+  const [oko, okh, okl, okc] = okx;
+  const [go, gh, gl, gc] = spot;
+  const o = oko - go;
+  const c = okc - gc;
+  const h0 = okh - gl;
+  const l0 = okl - gh;
+  let h = Math.max(h0, o, c);
+  let l = Math.min(l0, o, c);
+  if (l > h) {
+    l = Math.min(o, c);
+    h = Math.max(o, c);
+  }
+  return [o, h, l, c];
+}
+
+type SpreadAlignedRow =
+  | { t_sec: number; okx: Tuple4; gate: Tuple4 }
+  | { t_sec: number; okx: Tuple4; bitget: Tuple4 };
+
+async function aligned1mOkxGateSpreadFrame(fetchStart: number, endSec: number): Promise<SpreadAlignedRow[]> {
+  const [okxMap, gateMap] = await Promise.all([
+    okxFetchCandlesMap("1m", fetchStart, endSec),
+    gateFetchCandlesMap("1m", fetchStart, endSec),
+  ]);
+  const keys = Array.from(okxMap.keys())
+    .filter((k) => gateMap.has(k))
+    .sort((a, b) => a - b);
+  const out: SpreadAlignedRow[] = [];
+  for (const ts of keys) {
+    const ok = okxMap.get(ts)!;
+    const gt = gateMap.get(ts)!;
+    out.push({
+      t_sec: ts,
+      okx: [ok.o, ok.h, ok.l, ok.c],
+      gate: [gt.o, gt.h, gt.l, gt.c],
+    });
+  }
+  return out;
+}
+
+async function aligned1mOkxBitgetSpreadFrame(fetchStart: number, endSec: number): Promise<SpreadAlignedRow[]> {
+  const [okxMap, bitgetMap] = await Promise.all([
+    okxFetchCandlesMap("1m", fetchStart, endSec),
+    bitgetFetchCandlesMap(fetchStart, endSec),
+  ]);
+  const keys = Array.from(okxMap.keys())
+    .filter((k) => bitgetMap.has(k))
+    .sort((a, b) => a - b);
+  const out: SpreadAlignedRow[] = [];
+  for (const ts of keys) {
+    const ok = okxMap.get(ts)!;
+    const bg = bitgetMap.get(ts)!;
+    out.push({
+      t_sec: ts,
+      okx: [ok.o, ok.h, ok.l, ok.c],
+      bitget: [bg.o, bg.h, bg.l, bg.c],
+    });
+  }
+  return out;
+}
+
 async function aligned1mOkxGateFrame(fetchStart: number, endSec: number): Promise<FrameRow[]> {
   const [okxMap, gateMap] = await Promise.all([
     okxFetchCandlesMap("1m", fetchStart, endSec),
@@ -450,6 +515,153 @@ function stripPctClose(candles: CandlePct[]): { t: number; o: number; h: number;
     l: c.l,
     c: c.c,
   }));
+}
+
+function frameTo1mSpreadCandles(rows: SpreadAlignedRow[]): CandlePct[] {
+  const out: CandlePct[] = [];
+  for (const r of rows) {
+    const spot = "gate" in r ? r.gate : r.bitget;
+    const [so, sh, sl, sc] = spreadOhlc(r.okx, spot);
+    const gc = spot[3];
+    const pct = gc ? ((r.okx[3] - gc) / gc) * 100 : null;
+    out.push({ t: r.t_sec, o: so, h: sh, l: sl, c: sc, pct_close: pct });
+  }
+  return out;
+}
+
+function normalizeSpreadTf(tf: string | null): string {
+  const t = (tf || "1m").toLowerCase().trim();
+  if (t === "1m" || t === "5m" || t === "1h" || t === "4h" || t === "1d") return t;
+  return "1m";
+}
+
+function spreadEffectiveFromSec(discoverSec: number, fromTs: number): { effFrom: number; winMode: string } {
+  if (fromTs === 0) return { effFrom: discoverSec, winMode: "listing" };
+  if (fromTs < 0) return { effFrom: SPREAD_DEFAULT_FROM_TS_SEC, winMode: "default_beijing_20260507_1800" };
+  return { effFrom: fromTs, winMode: "custom" };
+}
+
+function spreadCacheKey(tfNorm: string, effFrom: number, vn: "gate" | "bitget"): string {
+  return `${tfNorm}|${effFrom}|${vn}`;
+}
+
+/**
+ * OKX×Gate / OKX×Bitget「USDT 价差 K」：与 FastAPI `/api/price-spread-candles`（_price_spread_candles_build）同源。
+ * 供 Worker 在未配置 BACKEND_ORIGIN 时 standalone 返回。
+ */
+export async function buildPriceSpreadCandlesPayload(url: URL): Promise<Record<string, unknown>> {
+  const tfNorm = normalizeSpreadTf(url.searchParams.get("tf"));
+  const fromParam = url.searchParams.get("from_ts");
+  let fromTs = -1;
+  if (fromParam != null && fromParam !== "") {
+    const n = Number(fromParam);
+    if (Number.isFinite(n)) fromTs = Math.floor(n);
+  }
+  const venueRaw = url.searchParams.get("venue");
+  const vn: "gate" | "bitget" = venueRaw?.toLowerCase() === "bitget" ? "bitget" : "gate";
+
+  const rollupDay = tfNorm === "1d";
+  const discover = await discoverOkxEarliestSec();
+  if (discover == null) {
+    return { ok: false, error: "okx_listing_unavailable", tf: tfNorm, venue: vn, cached: false };
+  }
+
+  const { effFrom, winMode } = spreadEffectiveFromSec(discover, fromTs);
+  const endSec = Math.floor(Date.now() / 1000);
+  const fetchStart = alignedRestFetchStartSec(discover);
+
+  const frame =
+    vn === "bitget"
+      ? await aligned1mOkxBitgetSpreadFrame(fetchStart, endSec)
+      : await aligned1mOkxGateSpreadFrame(fetchStart, endSec);
+
+  let one_m = frameTo1mSpreadCandles(frame);
+  one_m = one_m.filter((c) => c.t >= effFrom);
+
+  let candles: CandlePct[];
+  if (rollupDay) {
+    let hourly = resampleOhlcCandles(one_m, 3600);
+    hourly = hourly.filter((c) => c.t >= effFrom);
+    candles = rollupSpreadToUtcDay(hourly);
+  } else {
+    const step = { "1m": 60, "5m": 300, "1h": 3600, "4h": 14400 }[tfNorm] ?? 60;
+    if (step === 60) {
+      candles = one_m;
+    } else {
+      candles = resampleOhlcCandles(one_m, step);
+      candles = candles.filter((c) => c.t >= effFrom);
+    }
+  }
+
+  const nBuilt = candles.length;
+  const candlesOut = nBuilt > MAX_HIST_CANDLES_RESPONSE ? candles.slice(-MAX_HIST_CANDLES_RESPONSE) : candles;
+
+  const lows = candlesOut.map((x) => x.l);
+  const highs = candlesOut.map((x) => x.h);
+  const rng = {
+    min: lows.length ? Math.min(...lows) : null,
+    max: highs.length ? Math.max(...highs) : null,
+  };
+
+  const effCn = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(effFrom * 1000));
+
+  const meta: Record<string, unknown> = {
+    okx_inst: OKX_INST_ID,
+    spot_venue: vn,
+    okx_listing_first_ts_sec: discover,
+    okx_listing_first_ts_iso: new Date(discover * 1000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    window_from_ts_sec: effFrom,
+    window_from_ts_iso_utc: new Date(effFrom * 1000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    window_from_beijing: `${effCn.replace(/\//g, "-")}（UTC+8）`,
+    window_mode: winMode,
+    merged_bars: nBuilt,
+    rollup_note: rollupDay
+      ? "1d 使用对齐的 1h 价差聚合为 UTC 0 点自然日（两家原生日 K 边界不同）。"
+      : null,
+  };
+  if (vn === "bitget") {
+    meta.bitget_symbol = BITGET_SYMBOL;
+  } else {
+    meta.gate_pair = GATE_CURRENCY_PAIR;
+  }
+
+  const definitionGate =
+    "每根 K：先对齐 1m OKX 永续与 Gate 现货 OHLC，在同一 time bucket 上合成价差 OHLC（high=max(OKX.high−Gate.low, open, close)；" +
+    "low=min(OKX.low−Gate.high, open, close)）；大于 1m 的周期由 1m 价差 K 重采样；1d 再经 1h 聚合为 UTC 自然日。" +
+    "与 /api/candles?venue=gate 市值差% 同源；Worker 内联 REST（与 spacex_spread_monitor/main.py 一致）。默认窗北京时间 2026-05-07 18:00 起；from_ts=0 表示从 OKX 可溯起点。";
+
+  const definitionBitget =
+    "每根 K：先对齐 1m OKX 永续与 Bitget 现货 OHLC，在同一 time bucket 上合成价差 OHLC（high=max(OKX.high−Bitget.low, open, close)；" +
+    "low=min(OKX.low−Bitget.high, open, close)）；大于 1m 的周期由 1m 价差 K 重采样；1d 再经 1h 聚合为 UTC 自然日。" +
+    "与 /api/candles?venue=bitget 市值差% 同源；Worker 内联 REST（与 spacex_spread_monitor/main.py 一致）。默认窗北京时间 2026-05-07 18:00 起；from_ts=0 表示从 OKX 可溯起点。";
+
+  return {
+    ok: true,
+    venue: vn,
+    tf: tfNorm,
+    from_ts: fromTs,
+    effective_from_ts_sec: effFrom,
+    cache_key: spreadCacheKey(tfNorm, effFrom, vn),
+    definition: vn === "bitget" ? definitionBitget : definitionGate,
+    meta,
+    candles: candlesOut,
+    candles_built: nBuilt,
+    candles_truncated: nBuilt > MAX_HIST_CANDLES_RESPONSE,
+    candles_max_return: MAX_HIST_CANDLES_RESPONSE,
+    range: rng,
+    built_at_ms: Date.now(),
+    cached: false,
+    data_source_detail:
+      "Cloudflare Worker 内联 OKX+现货 REST，价差 OHLC 与 FastAPI _spread_ohlc 同源；可选 BACKEND_ORIGIN 仍优先反向代理。",
+  };
 }
 
 export async function buildGateHistRemotePayload(tfSecIn: number): Promise<Record<string, unknown>> {

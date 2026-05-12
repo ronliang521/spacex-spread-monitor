@@ -3,7 +3,11 @@
  * State (config, history, quote cache, bark cooldown) lives in isolate memory.
  */
 
-import { buildBitgetHistRemotePayload, buildGateHistRemotePayload } from "./remoteCandles";
+import {
+  buildBitgetHistRemotePayload,
+  buildGateHistRemotePayload,
+  buildPriceSpreadCandlesPayload,
+} from "./remoteCandles";
 
 export interface Env {
   ASSETS: Fetcher;
@@ -772,15 +776,20 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (path === "/api/price-spread-candles" && request.method === "GET") {
     const proxied = await proxyBackendApi(env, "/api/price-spread-candles", url);
     if (proxied != null) return proxied;
-    return json(
-      {
-        ok: false,
-        error: "cloudflare_worker_stub",
-        hint:
-          "价差 USDT K 线需在 FastAPI 运行 /api/price-spread-candles，或在 Worker 环境变量中设置 BACKEND_ORIGIN 指向该后端以反向代理。历史差值% K 线（Gate / Bitget）已由 Worker 内联 OKX+对应现货 REST 支持（与 FastAPI 同源算法）。",
-      },
-      { status: 501 },
-    );
+    try {
+      const payload = await buildPriceSpreadCandlesPayload(url);
+      return json(payload);
+    } catch (e) {
+      return json(
+        {
+          ok: false,
+          error: String(e),
+          hint:
+            "Worker 内联价差 K 构建失败（超时或上游 REST 异常）。可配置 BACKEND_ORIGIN 指向 FastAPI /api/price-spread-candles 作为备用。",
+        },
+        { status: 502 },
+      );
+    }
   }
   if (path === "/api/quote" && request.method === "GET") return handleApiQuoteWithEnv(url, env);
   if (path === "/api/bark/test" && request.method === "POST") return handleApiBarkTest(request);
