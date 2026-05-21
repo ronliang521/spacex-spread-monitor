@@ -1,6 +1,11 @@
 /** Shared with cloudflare/src/index.ts remote quote paths — single source for REST K 聚合 */
 export const OKX_INST_ID = "SPACEX-USDT-SWAP";
 export const GATE_CURRENCY_PAIR = "SPCX_USDT";
+/**
+ * Gate spot candlesticks：官方文案为 Maximum 10000 points ago，但 from=end−10000×1m 仍会 400；
+ * 实测 end−9998×1m 可拉通，故钳制回溯根数取 9998（留 2 根余量）。
+ */
+export const GATE_MAX_CANDLESTICK_POINTS = 9998;
 export const BITGET_SYMBOL = "PRESPAXUSDT";
 
 export const OKX_SHARES_OUTSTANDING = 1_000_000_000;

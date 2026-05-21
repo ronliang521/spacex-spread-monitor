@@ -327,15 +327,27 @@ def _gate_bar_seconds(gate_interval: str) -> int:
 
 
 def _gate_chunk_span_sec(gate_interval: str) -> int:
-    """Gate allows up to 1000 candles per request; chunk the time range accordingly."""
-    return 1000 * _gate_bar_seconds(gate_interval)
+    """Gate 单次约 1000 根上限；在最早可溯边界 1000 根会 400，按 999 根分片。"""
+    return 999 * _gate_bar_seconds(gate_interval)
+
+
+# Gate spot candlesticks：官方 Maximum 10000 points ago，边界 from=end−10000×1m 仍 400；实测 9998 可拉通
+GATE_MAX_CANDLESTICK_POINTS = 9998
+
+
+def _gate_earliest_fetch_sec(gate_interval: str, end_sec: int) -> int:
+    return int(end_sec) - int(GATE_MAX_CANDLESTICK_POINTS) * int(_gate_bar_seconds(gate_interval))
+
+
+def _clamp_gate_fetch_start(start_sec: int, end_sec: int, gate_interval: str) -> int:
+    return max(int(start_sec), _gate_earliest_fetch_sec(gate_interval, int(end_sec)))
 
 
 def _gate_fetch_candles_map(sess: requests.Session, gate_interval: str, start_sec: int, end_sec: int) -> Dict[int, Tuple[float, float, float, float]]:
     out: Dict[int, Tuple[float, float, float, float]] = {}
     url = "https://api.gateio.ws/api/v4/spot/candlesticks"
     step = _gate_chunk_span_sec(gate_interval)
-    t = int(start_sec)
+    t = _clamp_gate_fetch_start(int(start_sec), int(end_sec), gate_interval)
     while t <= int(end_sec):
         chunk_end = min(int(end_sec), t + step - 1)
         r = sess.get(
@@ -488,8 +500,9 @@ def _aligned_1m_okx_gate_frame(sess: requests.Session, fetch_start: int, end_sec
     """
     对齐 1m：同一 time bucket 上 OKX 永续与 Gate 现货 OHLC，并算出 USDT 价差 OHLC（_spread_ohlc）与市值差值%（收盘口径）。
     """
-    okx_map = _okx_fetch_candles_map(sess, "1m", fetch_start, end_sec)
-    gate_map = _gate_fetch_candles_map(sess, "1m", fetch_start, end_sec)
+    start = _clamp_gate_fetch_start(int(fetch_start), int(end_sec), "1m")
+    okx_map = _okx_fetch_candles_map(sess, "1m", start, end_sec)
+    gate_map = _gate_fetch_candles_map(sess, "1m", start, end_sec)
     keys = sorted(set(okx_map.keys()) & set(gate_map.keys()))
     out: List[Dict[str, Any]] = []
     for ts in keys:

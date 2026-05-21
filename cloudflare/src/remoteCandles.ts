@@ -11,6 +11,7 @@ import {
   BITGET_SPOT_PAGE_URL,
   BITGET_SYMBOL,
   GATE_CURRENCY_PAIR,
+  GATE_MAX_CANDLESTICK_POINTS,
   GATE_SHARES_OUTSTANDING,
   OKX_INST_ID,
   OKX_SHARES_OUTSTANDING,
@@ -167,18 +168,35 @@ async function discoverOkxEarliestSec(): Promise<number | null> {
   return okxEarliestSecMem;
 }
 
+const OKX_REST_PAGE_DELAY_MS = 120;
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function okxFetchJson(url: string, label: string): Promise<{ data?: unknown[] }> {
+  let lastStatus = 0;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    if (attempt > 0) await sleepMs(400 * attempt);
+    const r = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+    lastStatus = r.status;
+    if (r.status === 429) continue;
+    if (!r.ok) throw new Error(`${label}_http_${r.status}`);
+    return (await r.json()) as { data?: unknown[] };
+  }
+  throw new Error(`${label}_http_${lastStatus || 429}`);
+}
+
 async function okxFetchCandlesMap(bar: string, startSec: number, endSec: number): Promise<Map<number, Ohlc>> {
   const out = new Map<number, Ohlc>();
-  const r0 = await fetch(
+  const j0 = await okxFetchJson(
     `https://www.okx.com/api/v5/market/candles?${new URLSearchParams({
       instId: OKX_INST_ID,
       bar,
       limit: "300",
     })}`,
-    { signal: AbortSignal.timeout(30_000) },
+    "okx_candles",
   );
-  if (!r0.ok) throw new Error(`okx_candles_http_${r0.status}`);
-  const j0 = (await r0.json()) as { data?: unknown[] };
   for (const row of j0.data || []) {
     const p = parseOkxRow(row as unknown[]);
     if (!p) continue;
@@ -192,15 +210,14 @@ async function okxFetchCandlesMap(bar: string, startSec: number, endSec: number)
     out.size > 0 ? minFinite(Array.from(out.keys()))! * 1000 : Math.floor(endSec) * 1000;
   const urlHist = "https://www.okx.com/api/v5/market/history-candles";
   for (let iter = 0; iter < 3000; iter++) {
+    if (iter > 0) await sleepMs(OKX_REST_PAGE_DELAY_MS);
     const p = new URLSearchParams({
       instId: OKX_INST_ID,
       bar,
       limit: "300",
       after: String(Math.floor(afterMs)),
     });
-    const rh = await fetch(`${urlHist}?${p}`, { signal: AbortSignal.timeout(30_000) });
-    if (!rh.ok) throw new Error(`okx_hist_candles_http_${rh.status}`);
-    const jh = (await rh.json()) as { data?: unknown[] };
+    const jh = await okxFetchJson(`${urlHist}?${p}`, "okx_hist_candles");
     const rows = jh.data;
     if (!Array.isArray(rows) || rows.length === 0) break;
     let oldestMs = 0;
@@ -234,8 +251,18 @@ function gateBarSeconds(gateInterval: string): number {
   return { "1m": 60, "5m": 300, "1h": 3600, "4h": 14_400 }[gi] ?? 3600;
 }
 
+/** 单次请求最多约 1000 根；在可溯最早边界 1000 根会 400，故按 999 根分片 */
 function gateChunkSpanSec(gateInterval: string): number {
-  return 1000 * gateBarSeconds(gateInterval);
+  return 999 * gateBarSeconds(gateInterval);
+}
+
+/** Gate REST：1m 最多回溯 GATE_MAX_CANDLESTICK_POINTS 根，早于该时刻会 400 */
+function gateEarliestFetchSec(gateInterval: string, endSec: number): number {
+  return Math.floor(endSec) - GATE_MAX_CANDLESTICK_POINTS * gateBarSeconds(gateInterval);
+}
+
+function clampGateFetchStart(startSec: number, endSec: number, gateInterval: string): number {
+  return Math.max(Math.floor(startSec), gateEarliestFetchSec(gateInterval, endSec));
 }
 
 async function gateFetchCandlesMap(
@@ -246,8 +273,8 @@ async function gateFetchCandlesMap(
   const out = new Map<number, Ohlc>();
   const url = "https://api.gateio.ws/api/v4/spot/candlesticks";
   const step = gateChunkSpanSec(gateInterval);
-  let t = Math.floor(startSec);
   const end = Math.floor(endSec);
+  let t = clampGateFetchStart(startSec, end, gateInterval);
   while (t <= end) {
     const chunkEnd = Math.min(end, t + step - 1);
     const p = new URLSearchParams({
@@ -352,10 +379,9 @@ type SpreadAlignedRow =
   | { t_sec: number; okx: Tuple4; bitget: Tuple4 };
 
 async function aligned1mOkxGateSpreadFrame(fetchStart: number, endSec: number): Promise<SpreadAlignedRow[]> {
-  const [okxMap, gateMap] = await Promise.all([
-    okxFetchCandlesMap("1m", fetchStart, endSec),
-    gateFetchCandlesMap("1m", fetchStart, endSec),
-  ]);
+  const start = clampGateFetchStart(fetchStart, endSec, "1m");
+  const gateMap = await gateFetchCandlesMap("1m", start, endSec);
+  const okxMap = await okxFetchCandlesMap("1m", start, endSec);
   const keys = Array.from(okxMap.keys())
     .filter((k) => gateMap.has(k))
     .sort((a, b) => a - b);
@@ -394,10 +420,9 @@ async function aligned1mOkxBitgetSpreadFrame(fetchStart: number, endSec: number)
 }
 
 async function aligned1mOkxGateFrame(fetchStart: number, endSec: number): Promise<FrameRow[]> {
-  const [okxMap, gateMap] = await Promise.all([
-    okxFetchCandlesMap("1m", fetchStart, endSec),
-    gateFetchCandlesMap("1m", fetchStart, endSec),
-  ]);
+  const start = clampGateFetchStart(fetchStart, endSec, "1m");
+  const gateMap = await gateFetchCandlesMap("1m", start, endSec);
+  const okxMap = await okxFetchCandlesMap("1m", start, endSec);
   const keys = Array.from(okxMap.keys())
     .filter((k) => gateMap.has(k))
     .sort((a, b) => a - b);
@@ -590,6 +615,9 @@ export async function buildPriceSpreadCandlesPayload(url: URL): Promise<Record<s
   const { effFrom, winMode } = spreadEffectiveFromSec(discover, fromTs);
   const endSec = Math.floor(Date.now() / 1000);
   const fetchStart = alignedRestFetchStartSec(discover);
+  const gateEarliest =
+    vn === "gate" ? gateEarliestFetchSec("1m", endSec) : null;
+  const gateFetchClamped = gateEarliest != null && fetchStart < gateEarliest;
 
   const frame =
     vn === "bitget"
@@ -647,6 +675,11 @@ export async function buildPriceSpreadCandlesPayload(url: URL): Promise<Record<s
     rollup_note: rollupDay
       ? "1d 使用对齐的 1h 价差聚合为 UTC 0 点自然日（两家原生日 K 边界不同）。"
       : null,
+    gate_fetch_clamped: gateFetchClamped || undefined,
+    gate_earliest_ts_sec: gateEarliest ?? undefined,
+    gate_lookback_note: gateFetchClamped
+      ? `Gate REST 仅允许最近 ${GATE_MAX_CANDLESTICK_POINTS} 根 1m；实际拉取起点已自动钳到 Gate 可溯最早时刻（早于默认窗左侧可能无 K 线）。`
+      : undefined,
   };
   if (vn === "bitget") {
     meta.bitget_symbol = BITGET_SYMBOL;
