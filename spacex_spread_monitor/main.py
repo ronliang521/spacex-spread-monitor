@@ -267,9 +267,13 @@ def _discover_okx_earliest_sec(sess: requests.Session) -> Optional[int]:
 def _okx_fetch_candles_map(sess: requests.Session, bar: str, start_sec: int, end_sec: int) -> Dict[int, Tuple[float, float, float, float]]:
     out: Dict[int, Tuple[float, float, float, float]] = {}
     url_recent = "https://www.okx.com/api/v5/market/candles"
-    r0 = sess.get(url_recent, params={"instId": OKX_INST_ID, "bar": bar, "limit": "300"}, timeout=30)
-    r0.raise_for_status()
-    for row in (r0.json() or {}).get("data") or []:
+    j0 = _okx_rest_get_json(
+        sess,
+        url_recent,
+        {"instId": OKX_INST_ID, "bar": bar, "limit": "300"},
+        "okx_candles",
+    )
+    for row in j0.get("data") or []:
         p = _parse_okx_candle_row(row)
         if not p:
             continue
@@ -286,11 +290,12 @@ def _okx_fetch_candles_map(sess: requests.Session, bar: str, start_sec: int, end
     else:
         after_ms = int(end_sec) * 1000
 
-    for _ in range(3000):
+    for i in range(3000):
+        if i > 0:
+            time.sleep(0.12)
         params: Dict[str, str] = {"instId": OKX_INST_ID, "bar": bar, "limit": "300", "after": str(int(after_ms))}
-        rh = sess.get(url_hist, params=params, timeout=30)
-        rh.raise_for_status()
-        rows = (rh.json() or {}).get("data") or []
+        jh = _okx_rest_get_json(sess, url_hist, params, "okx_hist_candles")
+        rows = jh.get("data") or []
         if not isinstance(rows, list) or not rows:
             break
         try:
@@ -341,6 +346,27 @@ def _gate_earliest_fetch_sec(gate_interval: str, end_sec: int) -> int:
 
 def _clamp_gate_fetch_start(start_sec: int, end_sec: int, gate_interval: str) -> int:
     return max(int(start_sec), _gate_earliest_fetch_sec(gate_interval, int(end_sec)))
+
+
+def _spread_aligned_fetch_start(discover_sec: int, end_sec: int) -> int:
+    """价差/对齐 K 线共用：REST 拉取起点不早于 Gate 可溯边界，避免 Gate 400 与 OKX 过量分页。"""
+    base = _aligned_rest_fetch_start_sec(int(discover_sec))
+    return max(base, _gate_earliest_fetch_sec("1m", int(end_sec)))
+
+
+def _okx_rest_get_json(sess: requests.Session, url: str, params: Dict[str, str], label: str) -> Dict[str, Any]:
+    last_status = 0
+    for attempt in range(6):
+        if attempt > 0:
+            time.sleep(0.4 * attempt)
+        r = sess.get(url, params=params, timeout=30)
+        last_status = int(r.status_code)
+        if r.status_code == 429:
+            continue
+        r.raise_for_status()
+        payload = r.json() or {}
+        return payload if isinstance(payload, dict) else {}
+    raise RuntimeError(f"{label}_http_{last_status or 429}")
 
 
 def _gate_fetch_candles_map(sess: requests.Session, gate_interval: str, start_sec: int, end_sec: int) -> Dict[int, Tuple[float, float, float, float]]:
@@ -439,8 +465,9 @@ def _bitget_fetch_candles_map(sess: requests.Session, start_sec: int, end_sec: i
 
 def _aligned_1m_okx_bitget_frame(sess: requests.Session, fetch_start: int, end_sec: int) -> List[Dict[str, Any]]:
     """对齐 1m：同一 bucket 上 OKX 永续与 Bitget 现货 OHLC，USDT 价差 OHLC（_spread_ohlc）与收盘口径市值差值%（相对 Bitget）。"""
-    okx_map = _okx_fetch_candles_map(sess, "1m", fetch_start, end_sec)
-    bitget_map = _bitget_fetch_candles_map(sess, fetch_start, end_sec)
+    start = max(int(fetch_start), _gate_earliest_fetch_sec("1m", int(end_sec)))
+    okx_map = _okx_fetch_candles_map(sess, "1m", start, end_sec)
+    bitget_map = _bitget_fetch_candles_map(sess, start, end_sec)
     keys = sorted(set(okx_map.keys()) & set(bitget_map.keys()))
     out: List[Dict[str, Any]] = []
     for ts in keys:
@@ -500,7 +527,7 @@ def _aligned_1m_okx_gate_frame(sess: requests.Session, fetch_start: int, end_sec
     """
     对齐 1m：同一 time bucket 上 OKX 永续与 Gate 现货 OHLC，并算出 USDT 价差 OHLC（_spread_ohlc）与市值差值%（收盘口径）。
     """
-    start = _clamp_gate_fetch_start(int(fetch_start), int(end_sec), "1m")
+    start = max(int(fetch_start), _gate_earliest_fetch_sec("1m", int(end_sec)))
     okx_map = _okx_fetch_candles_map(sess, "1m", start, end_sec)
     gate_map = _gate_fetch_candles_map(sess, "1m", start, end_sec)
     keys = sorted(set(okx_map.keys()) & set(gate_map.keys()))
@@ -689,7 +716,7 @@ def _price_spread_candles_build(tf: str, from_ts: int, venue_norm: str = "gate")
         return {"ok": False, "error": "okx_listing_unavailable", "tf": tf_norm, "venue": vn}
     eff_from, win_mode = _spread_effective_from_sec(sess, int(from_ts))
     end_sec = int(time.time())
-    fetch_start = _aligned_rest_fetch_start_sec(int(discover_sec))
+    fetch_start = _spread_aligned_fetch_start(int(discover_sec), end_sec)
 
     if vn == "bitget":
         frame = _get_aligned_1m_bitget_frame_cached(sess, fetch_start, end_sec)
@@ -1255,8 +1282,8 @@ def _gate_hist_candles_from_rest_sync(tf_s: int) -> Dict[str, Any]:
             "price_sources": {"okx_instId": OKX_INST_ID, "gate_currency_pair": GATE_CURRENCY_PAIR},
             "window_timezone_note": "默认窗起点为北京时间；K 线时间戳为 Unix 秒；图表建议 Asia/Shanghai 显示",
         }
-    fetch_start = _aligned_rest_fetch_start_sec(int(discover))
     end_sec = int(time.time())
+    fetch_start = _spread_aligned_fetch_start(int(discover), end_sec)
     frame = _get_aligned_1m_frame_cached(sess, fetch_start, end_sec)
     one_m = _frame_to_1m_mcap_pct_candles(frame, floor_sec)
     if tf_i == 86_400:
@@ -1350,8 +1377,8 @@ def _bitget_hist_candles_from_rest_sync(tf_s: int) -> Dict[str, Any]:
             },
             "window_timezone_note": "默认窗起点为北京时间；K 线时间戳为 Unix 秒；图表建议 Asia/Shanghai 显示",
         }
-    fetch_start = _aligned_rest_fetch_start_sec(int(discover))
     end_sec = int(time.time())
+    fetch_start = _spread_aligned_fetch_start(int(discover), end_sec)
     frame = _get_aligned_1m_bitget_frame_cached(sess, fetch_start, end_sec)
     one_m = _frame_to_1m_mcap_pct_candles(frame, floor_sec)
     if tf_i == 86_400:

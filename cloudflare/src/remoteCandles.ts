@@ -265,6 +265,11 @@ function clampGateFetchStart(startSec: number, endSec: number, gateInterval: str
   return Math.max(Math.floor(startSec), gateEarliestFetchSec(gateInterval, endSec));
 }
 
+/** 价差 K / 对齐表：OKX+现货 REST 起点（与 Python _spread_aligned_fetch_start 一致） */
+function spreadAlignedFetchStart(discoverSec: number, endSec: number): number {
+  return Math.max(alignedRestFetchStartSec(discoverSec), gateEarliestFetchSec("1m", endSec));
+}
+
 async function gateFetchCandlesMap(
   gateInterval: string,
   startSec: number,
@@ -399,10 +404,9 @@ async function aligned1mOkxGateSpreadFrame(fetchStart: number, endSec: number): 
 }
 
 async function aligned1mOkxBitgetSpreadFrame(fetchStart: number, endSec: number): Promise<SpreadAlignedRow[]> {
-  const [okxMap, bitgetMap] = await Promise.all([
-    okxFetchCandlesMap("1m", fetchStart, endSec),
-    bitgetFetchCandlesMap(fetchStart, endSec),
-  ]);
+  const start = clampGateFetchStart(fetchStart, endSec, "1m");
+  const bitgetMap = await bitgetFetchCandlesMap(start, endSec);
+  const okxMap = await okxFetchCandlesMap("1m", start, endSec);
   const keys = Array.from(okxMap.keys())
     .filter((k) => bitgetMap.has(k))
     .sort((a, b) => a - b);
@@ -614,7 +618,7 @@ export async function buildPriceSpreadCandlesPayload(url: URL): Promise<Record<s
 
   const { effFrom, winMode } = spreadEffectiveFromSec(discover, fromTs);
   const endSec = Math.floor(Date.now() / 1000);
-  const fetchStart = alignedRestFetchStartSec(discover);
+  const fetchStart = spreadAlignedFetchStart(discover, endSec);
   const gateEarliest =
     vn === "gate" ? gateEarliestFetchSec("1m", endSec) : null;
   const gateFetchClamped = gateEarliest != null && fetchStart < gateEarliest;
@@ -748,7 +752,7 @@ export async function buildGateHistRemotePayload(tfSecIn: number): Promise<Recor
   }
 
   const endSec = Math.floor(Date.now() / 1000);
-  const fetchStart = alignedRestFetchStartSec(discover);
+  const fetchStart = spreadAlignedFetchStart(discover, endSec);
   const frame = await aligned1mOkxGateFrame(fetchStart, endSec);
   const floorSec = effFrom;
   const one_m = frameTo1mMcapPctCandles(frame, floorSec);
@@ -863,7 +867,7 @@ export async function buildBitgetHistRemotePayload(tfSecIn: number): Promise<Rec
   }
 
   const endSec = Math.floor(Date.now() / 1000);
-  const fetchStart = alignedRestFetchStartSec(discover);
+  const fetchStart = spreadAlignedFetchStart(discover, endSec);
   const frame = await aligned1mOkxBitgetFrame(fetchStart, endSec);
   const floorSec = effFrom;
   const one_m = frameTo1mMcapPctCandles(frame, floorSec);
